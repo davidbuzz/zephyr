@@ -4,6 +4,7 @@ board_set_flasher_ifnset(esp32)
 board_set_debugger_ifnset(openocd)
 
 board_runner_args(openocd  --no-init --no-halt --no-targets --no-load)
+board_runner_args(openocd  --gdb-init "appimage_offset 0x10000")
 board_runner_args(openocd  --gdb-init "set remote hardware-watchpoint-limit 2")
 
 board_runner_args(openocd  --gdb-init "flushregs")
