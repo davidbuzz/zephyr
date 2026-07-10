@@ -37,6 +37,12 @@ namespace std {
 
 } /* namespace std */
 
+/* Placement new — constructs in already-allocated storage.
+ * new (&buf) T(args)  requires operator new(size_t, void*) to be visible.
+ * The standard mandates this overload does nothing but return ptr. */
+inline void* operator new(std::size_t, void* ptr) _CPP_NOEXCEPT { return ptr; }
+inline void* operator new[](std::size_t, void* ptr) _CPP_NOEXCEPT { return ptr; }
+
 /* Declarations of the nothrow operator new/delete overloads.
  * The implementations live in lib/cpp/minimal/cpp_new.cpp.
  * Without these forward declarations, code that uses
