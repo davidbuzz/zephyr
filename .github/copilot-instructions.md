@@ -53,9 +53,13 @@ Basic tools (git, gcc, make, editors) should not be listed.
 
 ## C Code Style
 
-Follow the
-[Linux kernel coding style](https://kernel.org/doc/html/latest/process/coding-style.html)
-with these Zephyr-specific rules:
+Follow the Zephyr code style guide:
+https://docs.zephyrproject.org/latest/contribute/style/code.html
+
+For comment style in particular, follow the Linux kernel commenting guidance:
+https://kernel.org/doc/html/latest/process/coding-style.html#commenting
+
+Apply the following Zephyr-specific rules as well:
 
 - **Tabs** are 8 characters; **line length** ≤ 100 columns.
 - Use `snake_case` for all code and variable names.
