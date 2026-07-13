@@ -68,6 +68,8 @@ with these Zephyr-specific rules:
 - Capitalize correctly in comments: `UART` not `uart`, `CMake` not `cmake`.
 - Use spaces (not tabs) to align inline comments after declarations.
 - Style is enforced on new or modified code only — do not reformat unrelated existing code.
+- When multiple valid styles are possible, follow nearby code first (function, file, then
+  subsystem).
 
 ---
 
@@ -149,6 +151,18 @@ All new code must comply with the Zephyr MISRA-C subset. Key required rules:
 - Public API headers must use Doxygen `/** */` block comments.
 - Follow `doc/contribute/documentation/guidelines.rst` for formatting details.
 - URL references are the only allowed exception to the 100-column line limit in docs.
+
+---
+
+## Comment and Doxygen Style
+
+- Use `/* */` for regular C comments and `/** */` only for Doxygen comments that should appear in
+  generated documentation.
+- Do not use `//` comments.
+- Use `/**< */` for short trailing Doxygen member comments on the same line as a symbol.
+- Use `@` Doxygen commands, not `\` commands.
+- Write Doxygen brief text in the imperative mood.
+- For public headers, place an `@file` block after the SPDX header and copyright notice.
 
 ---
 
