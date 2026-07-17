@@ -1202,8 +1202,16 @@ static void spi_stm32_isr(const struct device *dev)
 #endif /* CONFIG_SPI_RTIO */
 
 	/* Some spurious interrupts are triggered when SPI is not enabled; ignore them.
+	 *
+	 * LOCAL ARDUPILOT PATCH: the IRQ line can remain asserted after the
+	 * SPI block was disabled mid-transfer (context timeout/abort with a
+	 * flag still set): nothing below clears the source, so returning
+	 * bare re-enters this ISR forever, starving every thread (observed
+	 * on STM32H743 SPI4 with 3 fast-sampling IMUs). Mask at NVIC; the
+	 * next transceive() re-enables the line (see irq_enable above).
 	 */
 	if (!LL_SPI_IsEnabled(spi)) {
+		irq_disable(cfg->irq_line);
 		return;
 	}
 
