@@ -180,26 +180,18 @@ static int mcux_pwm_set_cycles_internal(const struct device *dev, uint32_t chann
 
 		PWM_StartTimer(config->base, 1U << config->index);
 	} else {
-		uint64_t period_time_us =
-			(uint64_t)data->period_cycles[channel] * 1000000U / (pwm_clk_freq);
-		__ASSERT_NO_MSG(period_time_us <= 0xFFFFFFFFU);
-		/* Wait for the registers to finish their previous load (LDOK cleared).
-		 * The LDOK is cleared after one PWM period, so we wait period_time_us.
-		 * Keep 1 millisecond here for compatibility.
+		/* A previous load may still be pending (LDOK set), which locks the
+		 * double-buffered VALx registers. Busy-waiting for the hardware to
+		 * clear it costs up to a full PWM period per call - measured at
+		 * ~350 us per 400 Hz update cycle on an i.MX RT1176 flight
+		 * controller, where it dominated the cost of writing servo
+		 * outputs. Instead cancel the pending load with CLDOK: the
+		 * superseded values are simply replaced and the new ones latch at
+		 * the next reload, which is the desired latest-value-wins
+		 * semantics for a repeatedly-updated output.
 		 */
-		bool ldok_got_cleared = WAIT_FOR(
-			!(config->base->MCTRL & PWM_MCTRL_LDOK(1U << config->index)),
-			MAX(1000, (uint32_t)period_time_us),
-			k_busy_wait(1) /* busywait meanwhile */
-		);
-
-		if (!ldok_got_cleared) {
-			/*
-			 * LDOK didn't get cleared in timeout, which is extremely rare.
-			 * We return with an error though, because setting the VALx values in
-			 * this state would do nothing
-			 */
-			return -EBUSY;
+		if (config->base->MCTRL & PWM_MCTRL_LDOK(1U << config->index)) {
+			PWM_SetPwmLdok(config->base, 1U << config->index, false);
 		}
 
 		/* Setup VALx values directly for edge aligned PWM */
