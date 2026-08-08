@@ -81,6 +81,24 @@ static inline void lpspi_handle_rx_irq(const struct device *dev)
 	LOG_DBG("RX done %d words to spi buf", total_words_written);
 }
 
+/* RDF asserts while the RX FIFO count exceeds RXWATER, and
+ * lpspi_handle_rx_irq() drains the whole fifo each time it runs - so a
+ * watermark of one less than the number of words expected gives ONE RX
+ * interrupt per batch instead of one per received word. Long transfers cap
+ * the batch at half the fifo so draining stays ahead of overrun, and the
+ * isr retunes the watermark as the transfer progresses so the final
+ * partial batch still raises RDF. words == 0 keeps the per-word setting,
+ * which only occurs once RX is finished and RDIE is about to be masked.
+ */
+static void lpspi_master_set_rx_watermark(const struct device *dev, size_t words)
+{
+	const struct lpspi_config *config = dev->config;
+	LPSPI_Type *base = (LPSPI_Type *)DEVICE_MMIO_NAMED_GET(dev, reg_base);
+	size_t batch = MIN(words, (size_t)(config->rx_fifo_size / 2));
+
+	base->FCR = LPSPI_FCR_RXWATER(batch > 0 ? batch - 1 : 0);
+}
+
 /* constructs the next word from the buffer */
 static inline uint32_t lpspi_next_tx_word(const struct device *dev, const uint8_t *buf,
 					  int offset, size_t max_bytes)
@@ -252,9 +270,15 @@ static void lpspi_isr(const struct device *dev)
 		lpspi_handle_tx_irq(dev);
 	}
 
-	if (spi_context_rx_len_left(ctx, word_size_bytes) == 0) {
+	size_t rx_bytes_left = spi_context_rx_len_left(ctx, word_size_bytes);
+
+	if (rx_bytes_left == 0) {
 		base->IER &= ~LPSPI_IER_RDIE_MASK;
 		base->CR |= LPSPI_CR_RRF_MASK; /* flush rx fifo */
+	} else if (lpspi_data->lpspi_op_mode == SPI_OP_MODE_MASTER) {
+		/* retune so the final partial batch still raises RDF */
+		lpspi_master_set_rx_watermark(dev,
+			DIV_ROUND_UP(rx_bytes_left, word_size_bytes));
 	}
 
 	if (spi_context_tx_on(ctx)) {
