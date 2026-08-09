@@ -256,6 +256,21 @@ config I2C_MCUX_LPI2C
 	help
 	  Enable the mcux LPI2C driver.
 
+config I2C_MCUX_LPI2C_EDMA
+	bool "eDMA transfer path for MCUX LPI2C"
+	default y
+	depends on I2C_MCUX_LPI2C
+	depends on $(dt_compat_any_has_prop,$(DT_COMPAT_NXP_LPI2C),dmas)
+	select DMA
+	help
+	  Drive LPI2C transfers with eDMA on instances whose devicetree node
+	  carries a `dmas` property: the command/transmit stream is fed to
+	  MTDR by DMA and reads are drained from MRDR by DMA on the same
+	  (shared-request) channel, so a transfer costs a small constant
+	  number of interrupts instead of one per byte. Transfers that do not
+	  fit the staged fast path (more than two messages, 10-bit addresses,
+	  large writes) fall back to the interrupt state machine.
+
 config I2C_MCUX_LPI2C_BUS_RECOVERY
 	bool "Bus recovery support"
 	default y if I2C_BUS_RECOVERY

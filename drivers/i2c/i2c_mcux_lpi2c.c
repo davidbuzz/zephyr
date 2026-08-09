@@ -28,6 +28,11 @@
 #include <zephyr/drivers/gpio.h>
 #endif /* CONFIG_I2C_MCUX_LPI2C_BUS_RECOVERY */
 
+#ifdef CONFIG_I2C_MCUX_LPI2C_EDMA
+#include <zephyr/drivers/dma.h>
+#include <zephyr/linker/sections.h>
+#endif
+
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(mcux_lpi2c);
 
@@ -43,6 +48,47 @@ LOG_MODULE_REGISTER(mcux_lpi2c);
 	((const struct mcux_lpi2c_config *)(_dev)->config)
 #define DEV_DATA(_dev) ((struct mcux_lpi2c_data *)(_dev)->data)
 
+#ifdef CONFIG_I2C_MCUX_LPI2C_EDMA
+/*
+ * eDMA transfer state. LPI2C has ONE dma request line per instance
+ * (FSL_FEATURE_LPI2C_HAS_SEPARATE_DMA_RX_TX_REQ == 0 on i.MX RT11xx),
+ * so a single channel serves both phases: first MEMORY->MTDR pushing the
+ * 16-bit command/data stream (TDDE), then - for reads - MRDR->MEMORY
+ * draining the payload (RDDE), reconfigured in the phase-1 completion
+ * callback. SCL stretches while the RX FIFO is full, so the handover
+ * window is not timing critical.
+ *
+ * Staging lives in this struct, which is placed __nocache: eDMA moves
+ * physical bytes and does no cache maintenance, so coherent-by-placement
+ * is the same policy the rest of this board's DMA uses.
+ */
+#define LPI2C_EDMA_MAX_CMDS 20   /* start + up to 16 data/subaddr + recv + stop */
+#define LPI2C_EDMA_MAX_DATA 256  /* one RECV command's maximum payload */
+
+/* ONLY what eDMA itself touches goes __nocache. The nocache output
+ * section is NOBITS: it is neither loaded with initializer values nor
+ * guaranteed zeroed, so wiring/state MUST NOT live there (a garbage
+ * `active` made the ISR hook eat the fallback path's interrupts on the
+ * first integrated arm, wedging the bus lock forever). */
+struct mcux_lpi2c_edma_bufs {
+	uint16_t cmds[LPI2C_EDMA_MAX_CMDS];
+	uint8_t rx_stage[LPI2C_EDMA_MAX_DATA];
+};
+
+struct mcux_lpi2c_edma {
+	const struct device *dma_dev;
+	uint32_t channel;
+	uint32_t slot;             /* DMAMUX request source */
+	struct mcux_lpi2c_edma_bufs *bufs;
+	struct k_sem done;
+	volatile int result;
+	volatile bool active;
+	uint32_t rx_len;           /* 0 = write-only transfer */
+	uint8_t *user_rx;          /* destination in the caller's buffer */
+	uint32_t n_cmds;
+};
+#endif /* CONFIG_I2C_MCUX_LPI2C_EDMA */
+
 struct mcux_lpi2c_config {
 	DEVICE_MMIO_NAMED_ROM(reg_base);
 	const struct device *clock_dev;
@@ -57,6 +103,9 @@ struct mcux_lpi2c_config {
 	struct gpio_dt_spec sda;
 	bool recover_bus_on_init;
 #endif /* CONFIG_I2C_MCUX_LPI2C_BUS_RECOVERY */
+#ifdef CONFIG_I2C_MCUX_LPI2C_EDMA
+	struct mcux_lpi2c_edma *edma;   /* NULL when the node has no dmas */
+#endif
 };
 
 struct mcux_lpi2c_data {
@@ -147,6 +196,242 @@ static uint32_t mcux_lpi2c_convert_flags(int msg_flags)
 	return flags;
 }
 
+#ifdef CONFIG_I2C_MCUX_LPI2C_EDMA
+/* MTDR command encodings (LPI2C reference manual, MTDR[10:8]) */
+#define LPI2C_CMD_TXDATA(b)  ((uint16_t)(b))
+#define LPI2C_CMD_RECV(n)    (uint16_t)((1u << 8) | ((n) - 1u))
+#define LPI2C_CMD_STOP       ((uint16_t)(2u << 8))
+#define LPI2C_CMD_START(a)   (uint16_t)((4u << 8) | (a))
+
+static void mcux_lpi2c_edma_dma_cb(const struct device *dma_dev, void *user_data,
+				   uint32_t channel, int status);
+
+static void mcux_lpi2c_edma_finish(const struct device *dev, int result)
+{
+	const struct mcux_lpi2c_config *config = dev->config;
+	struct mcux_lpi2c_edma *e = config->edma;
+	LPI2C_Type *base = (LPI2C_Type *)DEVICE_MMIO_NAMED_GET(dev, reg_base);
+
+	base->MDER = 0;                                   /* TDDE/RDDE off */
+	base->MIER = 0;
+	if (result != 0) {
+		/* the REAL abort the IRQ path never had: kill the channel,
+		 * flush both FIFOs, clear sticky flags */
+		dma_stop(e->dma_dev, e->channel);
+		base->MCR |= LPI2C_MCR_RTF_MASK | LPI2C_MCR_RRF_MASK;
+		LPI2C_MasterClearStatusFlags(base, (uint32_t)kLPI2C_MasterClearFlags);
+	}
+	e->result = result;
+	e->active = false;
+	k_sem_give(&e->done);
+}
+
+static int mcux_lpi2c_edma_start_rx(const struct device *dev)
+{
+	const struct mcux_lpi2c_config *config = dev->config;
+	struct mcux_lpi2c_edma *e = config->edma;
+	LPI2C_Type *base = (LPI2C_Type *)DEVICE_MMIO_NAMED_GET(dev, reg_base);
+	struct dma_block_config blk = {0};
+	struct dma_config cfg = {0};
+
+	blk.source_address = (uint32_t)&base->MRDR;
+	blk.dest_address = (uint32_t)e->bufs->rx_stage;
+	blk.block_size = e->rx_len;
+	blk.source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+	blk.dest_addr_adj = DMA_ADDR_ADJ_INCREMENT;
+
+	cfg.channel_direction = PERIPHERAL_TO_MEMORY;
+	cfg.dma_slot = e->slot;
+	cfg.source_data_size = 1;
+	cfg.dest_data_size = 1;
+	cfg.source_burst_length = 1;
+	cfg.dest_burst_length = 1;
+	cfg.block_count = 1;
+	cfg.head_block = &blk;
+	cfg.dma_callback = mcux_lpi2c_edma_dma_cb;
+	cfg.user_data = (void *)dev;
+
+	int ret = dma_config(e->dma_dev, e->channel, &cfg);
+	if (ret == 0) {
+		base->MDER = LPI2C_MDER_RDDE_MASK;        /* switch request to RX */
+		ret = dma_start(e->dma_dev, e->channel);
+	}
+	return ret;
+}
+
+static void mcux_lpi2c_edma_dma_cb(const struct device *dma_dev, void *user_data,
+				   uint32_t channel, int status)
+{
+	const struct device *dev = user_data;
+	const struct mcux_lpi2c_config *config = dev->config;
+	struct mcux_lpi2c_edma *e = config->edma;
+
+	ARG_UNUSED(dma_dev);
+	ARG_UNUSED(channel);
+
+	if (!e->active) {
+		return;
+	}
+	if (status < 0) {
+		mcux_lpi2c_edma_finish(dev, -EIO);
+		return;
+	}
+	if (e->rx_len > 0 && e->n_cmds != 0) {
+		/* command stream delivered - hand the shared request to RX.
+		 * SCL stretches on RX-FIFO-full, so this is not a race. */
+		e->n_cmds = 0;                       /* marks RX phase */
+		if (mcux_lpi2c_edma_start_rx(dev) != 0) {
+			mcux_lpi2c_edma_finish(dev, -EIO);
+		}
+		return;
+	}
+	if (e->rx_len > 0) {
+		memcpy(e->user_rx, e->bufs->rx_stage, e->rx_len);
+	}
+	mcux_lpi2c_edma_finish(dev, 0);
+}
+
+/*
+ * Fast-path DMA transfer. Handles the traffic ArduPilot-class users
+ * generate - register writes, register reads with repeated start, plain
+ * reads - and returns -EAGAIN for anything else so the caller falls back
+ * to the interrupt state machine.
+ *
+ * Cost per transfer: one DMA-complete interrupt for pure writes (plus one
+ * LPI2C stop/error interrupt), two DMA-completes for reads. Compare one
+ * interrupt per BYTE on the fsl state machine (MFCR watermarks are 0).
+ */
+static int mcux_lpi2c_transfer_edma(const struct device *dev, struct i2c_msg *msgs,
+				    uint8_t num_msgs, uint16_t addr)
+{
+	const struct mcux_lpi2c_config *config = dev->config;
+	struct mcux_lpi2c_data *data = dev->data;
+	struct mcux_lpi2c_edma *e = config->edma;
+	LPI2C_Type *base = (LPI2C_Type *)DEVICE_MMIO_NAMED_GET(dev, reg_base);
+	uint32_t n = 0;
+
+	/* controller unusable (init found no DMA device): permanent fallback */
+	if (e->result == -ENODEV && !e->active) {
+		return -EAGAIN;
+	}
+	/* pattern gate */
+	if (num_msgs < 1 || num_msgs > 2) {
+		return -EAGAIN;
+	}
+	for (uint8_t i = 0; i < num_msgs; i++) {
+		if (msgs[i].flags & I2C_MSG_ADDR_10_BITS) {
+			return -EAGAIN;
+		}
+		if (msgs[i].len == 0) {
+			return -EAGAIN;   /* address-scan probes keep the IRQ path */
+		}
+	}
+
+	const struct i2c_msg *m0 = &msgs[0];
+	const struct i2c_msg *m1 = (num_msgs == 2) ? &msgs[1] : NULL;
+
+	e->rx_len = 0;
+	e->user_rx = NULL;
+
+	if (!(m0->flags & I2C_MSG_READ)) {
+		if (m0->len > 16) {
+			return -EAGAIN;   /* large writes: rare, IRQ path */
+		}
+		e->bufs->cmds[n++] = LPI2C_CMD_START((uint8_t)(addr << 1));
+		for (uint32_t i = 0; i < m0->len; i++) {
+			e->bufs->cmds[n++] = LPI2C_CMD_TXDATA(m0->buf[i]);
+		}
+		if (m1 != NULL) {
+			if (!(m1->flags & I2C_MSG_READ) || m1->len > LPI2C_EDMA_MAX_DATA) {
+				return -EAGAIN;
+			}
+			e->bufs->cmds[n++] = LPI2C_CMD_START((uint8_t)((addr << 1) | 1u));
+			e->bufs->cmds[n++] = LPI2C_CMD_RECV(m1->len);
+			e->rx_len = m1->len;
+			e->user_rx = m1->buf;
+		}
+	} else {
+		if (m1 != NULL || m0->len > LPI2C_EDMA_MAX_DATA) {
+			return -EAGAIN;
+		}
+		e->bufs->cmds[n++] = LPI2C_CMD_START((uint8_t)((addr << 1) | 1u));
+		e->bufs->cmds[n++] = LPI2C_CMD_RECV(m0->len);
+		e->rx_len = m0->len;
+		e->user_rx = m0->buf;
+	}
+	e->bufs->cmds[n++] = LPI2C_CMD_STOP;
+	e->n_cmds = n;
+
+	int ret = k_sem_take(&data->lock, K_FOREVER);
+	if (ret) {
+		return ret;
+	}
+	(void)pm_device_runtime_get(dev);
+
+	if (LPI2C_CheckForBusyBus(base) != kStatus_Success) {
+		ret = -EBUSY;
+		goto out;
+	}
+
+	LPI2C_MasterClearStatusFlags(base, (uint32_t)kLPI2C_MasterClearFlags);
+	k_sem_reset(&e->done);
+	e->result = 0;
+	e->active = true;
+
+	/* phase 1: command/data stream, 16-bit words into MTDR */
+	{
+		struct dma_block_config blk = {0};
+		struct dma_config cfg = {0};
+
+		blk.source_address = (uint32_t)e->bufs->cmds;
+		blk.dest_address = (uint32_t)&base->MTDR;
+		blk.block_size = e->n_cmds * sizeof(uint16_t);
+		blk.source_addr_adj = DMA_ADDR_ADJ_INCREMENT;
+		blk.dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+
+		cfg.channel_direction = MEMORY_TO_PERIPHERAL;
+		cfg.dma_slot = e->slot;
+		cfg.source_data_size = 2;
+		cfg.dest_data_size = 2;
+		cfg.source_burst_length = 2;
+		cfg.dest_burst_length = 2;
+		cfg.block_count = 1;
+		cfg.head_block = &blk;
+		cfg.dma_callback = mcux_lpi2c_edma_dma_cb;
+		cfg.user_data = (void *)dev;
+
+		ret = dma_config(e->dma_dev, e->channel, &cfg);
+		if (ret == 0) {
+			/* errors surface through the LPI2C IRQ: NACK, arb
+			 * loss, FIFO error, pin-low timeout */
+			base->MIER = LPI2C_MIER_NDIE_MASK | LPI2C_MIER_ALIE_MASK |
+				     LPI2C_MIER_FEIE_MASK | LPI2C_MIER_PLTIE_MASK;
+			base->MDER = LPI2C_MDER_TDDE_MASK;
+			ret = dma_start(e->dma_dev, e->channel);
+		}
+	}
+	if (ret != 0) {
+		e->active = false;
+		base->MDER = 0;
+		base->MIER = 0;
+		goto out;
+	}
+
+	/* bounded wait: a wedged bus reports instead of hanging the caller.
+	 * 100 ms >> any legal transfer (256 B at 100 kHz is ~23 ms). */
+	if (k_sem_take(&e->done, K_MSEC(100)) != 0) {
+		mcux_lpi2c_edma_finish(dev, -ETIMEDOUT);
+		(void)k_sem_take(&e->done, K_NO_WAIT);
+	}
+	ret = e->result;
+
+out:
+	(void)pm_device_runtime_put(dev);
+	k_sem_give(&data->lock);
+	return ret;
+}
+#endif /* CONFIG_I2C_MCUX_LPI2C_EDMA */
+
 static int mcux_lpi2c_transfer(const struct device *dev, struct i2c_msg *msgs,
 				   uint8_t num_msgs, uint16_t addr)
 {
@@ -156,6 +441,16 @@ static int mcux_lpi2c_transfer(const struct device *dev, struct i2c_msg *msgs,
 	lpi2c_master_transfer_t transfer;
 	status_t status;
 	int ret = 0;
+
+#ifdef CONFIG_I2C_MCUX_LPI2C_EDMA
+	if (config->edma != NULL) {
+		ret = mcux_lpi2c_transfer_edma(dev, msgs, num_msgs, addr);
+		if (ret != -EAGAIN) {
+			return ret;
+		}
+		ret = 0;   /* pattern outside the fast path: interrupt path below */
+	}
+#endif
 
 	ret = k_sem_take(&data->lock, K_FOREVER);
 	if (ret) {
@@ -494,6 +789,27 @@ static void mcux_lpi2c_isr(const struct device *dev)
 	}
 #endif /* CONFIG_I2C_TARGET */
 
+#ifdef CONFIG_I2C_MCUX_LPI2C_EDMA
+	{
+		const struct mcux_lpi2c_config *config = dev->config;
+
+		if (config->edma != NULL && config->edma->active) {
+			/* DMA-mode transfer: this IRQ is an error report
+			 * (MIER = NDF|ALF|FEF|PLTF only). Never hand it to
+			 * the fsl state machine - its unbounded status loop
+			 * is the ISR-livelock found live 2026-08-09. */
+			const uint32_t msr = base->MSR;
+
+			if (msr & (LPI2C_MSR_NDF_MASK | LPI2C_MSR_ALF_MASK |
+				   LPI2C_MSR_FEF_MASK | LPI2C_MSR_PLTF_MASK)) {
+				mcux_lpi2c_edma_finish(dev,
+					(msr & LPI2C_MSR_NDF_MASK) ? -EIO : -EFAULT);
+			}
+			return;
+		}
+	}
+#endif
+
 	LPI2C_MasterTransferHandleIRQ(LPI2C_IRQHANDLE_ARG, &data->handle);
 }
 
@@ -552,12 +868,33 @@ static int mcux_lpi2c_init(const struct device *dev)
 	lpi2c_master_config_t master_config;
 	int error;
 
+	ARG_UNUSED(data);
+
 	DEVICE_MMIO_NAMED_MAP(dev, reg_base, K_MEM_CACHE_NONE | K_MEM_DIRECT_MAP);
 
 	base = (LPI2C_Type *)DEVICE_MMIO_NAMED_GET(dev, reg_base);
 
 	k_sem_init(&data->lock, 1, 1);
 	k_sem_init(&data->device_sync_sem, 0, K_SEM_MAX_LIMIT);
+
+#ifdef CONFIG_I2C_MCUX_LPI2C_EDMA
+	if (config->edma != NULL) {
+		config->edma->active = false;
+		config->edma->result = 0;
+		config->edma->rx_len = 0;
+		config->edma->n_cmds = 0;
+		k_sem_init(&config->edma->done, 0, 1);
+		if (!device_is_ready(config->edma->dma_dev)) {
+			/* GRACEFUL: a missing/late DMA controller must not
+			 * take the whole I2C bus down with -ENODEV (first
+			 * integrated arm: every bus vanished and the vehicle
+			 * spun on a missing baro before serial init). Flag
+			 * the path unusable; transfers use the IRQ engine. */
+			LOG_WRN("lpi2c edma controller not ready, using IRQ path");
+			config->edma->result = -ENODEV;
+		}
+	}
+#endif
 
 	if (!device_is_ready(config->clock_dev)) {
 		LOG_ERR("clock control device not ready");
@@ -670,9 +1007,41 @@ static DEVICE_API(i2c, mcux_lpi2c_driver_api) = {
 		    (LISTIFY(DT_NUM_IRQS(DT_DRV_INST(n)),		\
 			I2C_MCUX_LPI2C_CONFIGURE_IRQ, (), n)))
 
+#ifdef CONFIG_I2C_MCUX_LPI2C_EDMA
+#ifdef CONFIG_NOCACHE_MEMORY
+#define I2C_MCUX_LPI2C_EDMA_BUF_ATTR __nocache
+#else
+#define I2C_MCUX_LPI2C_EDMA_BUF_ATTR
+#endif
+/* bufs: __nocache (DMA-touched, needs no init - written before every use).
+ * wiring/state: ORDINARY static with initializers (.data - loaded at boot);
+ * the nocache section is NOBITS and must never hold initialized state. */
+#define I2C_MCUX_LPI2C_EDMA_DEFINE(n)					\
+	IF_ENABLED(DT_INST_DMAS_HAS_NAME(n, transfer),			\
+	(static I2C_MCUX_LPI2C_EDMA_BUF_ATTR __aligned(4)		\
+		struct mcux_lpi2c_edma_bufs mcux_lpi2c_edma_bufs_##n;	\
+	static struct mcux_lpi2c_edma mcux_lpi2c_edma_##n = {		\
+		.dma_dev = DEVICE_DT_GET(				\
+			DT_INST_DMAS_CTLR_BY_NAME(n, transfer)),	\
+		/* nxp,mcux-edma cell names: "mux" is the CHANNEL number,
+		 * "source" is the DMAMUX request (binding comment, lines
+		 * 104-111 of nxp,mcux-edma.yaml) */		\
+		.channel = DT_INST_DMAS_CELL_BY_NAME(n, transfer, mux), \
+		.slot = DT_INST_DMAS_CELL_BY_NAME(n, transfer, source),	\
+		.bufs = &mcux_lpi2c_edma_bufs_##n,			\
+	};))
+#define I2C_MCUX_LPI2C_EDMA_INIT(n)					\
+	.edma = COND_CODE_1(DT_INST_DMAS_HAS_NAME(n, transfer),		\
+			    (&mcux_lpi2c_edma_##n), (NULL)),
+#else
+#define I2C_MCUX_LPI2C_EDMA_DEFINE(n)
+#define I2C_MCUX_LPI2C_EDMA_INIT(n)
+#endif /* CONFIG_I2C_MCUX_LPI2C_EDMA */
+
 #define I2C_MCUX_LPI2C_INIT(n)						\
 	PINCTRL_DT_INST_DEFINE(n);					\
 	I2C_MCUX_LPI2C_RECOVER_CHECK(n)					\
+	I2C_MCUX_LPI2C_EDMA_DEFINE(n)					\
 									\
 	static void mcux_lpi2c_config_func_##n(const struct device *dev)\
 	{								\
@@ -692,6 +1061,7 @@ static DEVICE_API(i2c, mcux_lpi2c_driver_api) = {
 		I2C_MCUX_LPI2C_SCL_INIT(n)				\
 		I2C_MCUX_LPI2C_SDA_INIT(n)				\
 		I2C_MCUX_LPI2C_RECOVER_BUS_ON_INIT(n)			\
+		I2C_MCUX_LPI2C_EDMA_INIT(n)				\
 		.bus_idle_timeout_ns =					\
 			UTIL_AND(DT_INST_NODE_HAS_PROP(n, bus_idle_timeout),\
 				 DT_INST_PROP(n, bus_idle_timeout)),	\

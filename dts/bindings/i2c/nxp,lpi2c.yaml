@@ -15,6 +15,17 @@ properties:
     type: int
     description: Bus idle timeout in nanoseconds
 
+  dmas:
+    description: |
+      Single shared eDMA request for this LPI2C instance (the LPI2C has one
+      DMA request line multiplexed between TX and RX; the driver switches
+      MDER.TDDE/RDDE between the command/transmit phase and the receive
+      phase on the same channel). Specifier: channel, then DMAMUX source.
+
+  dma-names:
+    description: |
+      Must be "transfer" when dmas is present.
+
   scl-gpios:
     type: phandle-array
     description: |
