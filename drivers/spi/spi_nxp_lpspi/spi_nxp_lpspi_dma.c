@@ -319,14 +319,41 @@ static int transceive_dma(const struct device *dev, const struct spi_config *spi
 		return -ENOTSUP;
 	}
 
-	/* Always use continuous mode to satisfy SPI API requirements. */
-	base->TCR |= LPSPI_TCR_CONT_MASK | LPSPI_TCR_CONTC_MASK;
-
 	/* Please set both watermarks as 0 because there are some synchronize requirements
 	 * between RX and TX on RT platform. TX and RX DMA callback must be called in interleaved
 	 * mode, a none-zero TX watermark may break this.
 	 */
 	base->FCR = LPSPI_FCR_TXWATER(0) | LPSPI_FCR_RXWATER(0);
+
+	/* Flush both FIFOs, as the CPU (spi_nxp_lpspi.c) and RTIO
+	 * (spi_nxp_lpspi_rtio.c) variants do before every transfer, so a word
+	 * left over from an earlier transceive cannot shift this one's RX
+	 * stream. Must happen BEFORE the TCR command below is queued, or the
+	 * TX-FIFO reset would flush the command word itself.
+	 */
+	base->CR |= LPSPI_CR_RRF_MASK | LPSPI_CR_RTF_MASK;
+
+	/* Use continuous mode so CS stays asserted for the whole zephyr xfer,
+	 * exactly as the CPU variant does (spi_nxp_lpspi.c). CONTC ("continue
+	 * previous command") may only be set when a previous command left the
+	 * frame open; the DMA variant used to set CONT|CONTC unconditionally,
+	 * which on a closed frame is invalid and on this IP (VERID major 1,
+	 * mr_vmu_rt1176) opens a phantom frame that inserts one extra RX FIFO
+	 * word - every RX byte then arrives one position stale (WHOAMI reads
+	 * returned the cmd-phase byte, FSR.RXCOUNT grew per transfer, SR.REF
+	 * latched).
+	 */
+	if ((spi_cfg->operation & SPI_HOLD_ON_CS) || (base->TCR & LPSPI_TCR_CONTC_MASK)) {
+		base->TCR |= LPSPI_TCR_CONT_MASK | LPSPI_TCR_CONTC_MASK;
+	} else {
+		base->TCR |= LPSPI_TCR_CONT_MASK;
+	}
+
+	/* The TCR write goes through the TX FIFO - let it drain before the DMA
+	 * channels are armed, as the CPU and RTIO variants do.
+	 */
+	lpspi_wait_tx_fifo_empty(dev);
+
 	spi_context_buffers_setup(&data->ctx, tx_bufs, rx_bufs, 1);
 
 	/* Set next dma size is invalid. */
