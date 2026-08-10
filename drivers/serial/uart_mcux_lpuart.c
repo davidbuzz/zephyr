@@ -1429,8 +1429,31 @@ static int mcux_lpuart_config_get(const struct device *dev, struct uart_config *
 static int mcux_lpuart_configure(const struct device *dev,
 				 const struct uart_config *cfg)
 {
-	/* Wait for Transmission Complete Flag */
+	/* Wait for Transmission Complete Flag - BOUNDED. This used to be an
+	 * unconditional `while (!TC) {}`, which hangs forever on an instance
+	 * whose transmitter has never completed a frame - measured on
+	 * mr_vmu_rt1176 2026-08-10: LPUART6, configured single-wire/half-
+	 * duplex for RC-in (RX-focused; single-wire mode drives TX only to
+	 * loop it back as the RX source), never sets TC on the very first
+	 * runtime uart_configure() call, hanging the whole boot sequence
+	 * solid inside this loop with the CPU otherwise healthy - PC parked
+	 * here, no exception, nothing else on the board able to make
+	 * progress because this ran from the main init thread before
+	 * set_system_initialized().
+	 *
+	 * 10ms is generous: a full byte at the slowest realistic UART baud
+	 * (9600) is ~1ms, so any port that ever actually transmitted would
+	 * clear this in well under a millisecond. The bound exists only to
+	 * turn an infinite hang into a bounded one on ports (or modes) where
+	 * TC's assertion condition can't be relied on - proceeding without
+	 * transmission genuinely complete is safe here because CTRL's TE/RE
+	 * bits get explicitly cleared immediately afterward anyway.
+	 */
+	const int64_t tc_deadline = k_uptime_get() + 10;
 	while (!(get_base(dev)->STAT & LPUART_STAT_TC_MASK)) {
+		if (k_uptime_get() >= tc_deadline) {
+			break;
+		}
 	}
 
 	/* Disable Transmitter and Receiver */
