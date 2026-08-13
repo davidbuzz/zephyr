@@ -380,7 +380,34 @@ static DEVICE_API(gpio, mcux_igpio_driver_api) = {
 	.pin_muxes = mcux_igpio_pinmux_##n,					\
 	.mux_count = DT_PROP_LEN(DT_DRV_INST(n), pinmux)
 
-#define MCUX_IGPIO_IRQ_INIT(n, i)					\
+/*
+ * LOCAL PATCH (ArduPilot mr_vmu_rt1176, 2026-08-13): when
+ * CONFIG_AP_RCIN_GPIO2_DIRECT_ISR is enabled, this driver does NOT claim
+ * the gpio2 instance's interrupt vectors - ArduPilot's RCInput.cpp
+ * IRQ_DIRECT_CONNECTs them as zero-latency interrupts instead.
+ *
+ * WHY: RC PPM-SUM decode timestamps GPIO edges in the ISR. Bench-measured
+ * on i.MX RT1176: kernel irq_lock() windows elsewhere in the system delayed
+ * ISR entry by up to ~300 us often enough to corrupt ~30% of measured pulse
+ * widths (fixed 390 us CPPM pulse measured as 51..610 us) - unflyable RC.
+ * Zephyr requires zero-latency ISRs to be IRQ_DIRECT_CONNECTed (static
+ * assert in IRQ_CONNECT), and a vector can only have one owner, so the
+ * driver's own connection for THIS ONE INSTANCE must be compiled out.
+ * Every other GPIO instance (gpio1/3/4/...; gpio3 carries the SD
+ * card-detect callback) keeps the normal driver ISR path.
+ *
+ * All non-IRQ driver functionality for gpio2 (pin configure, read/write,
+ * interrupt_configure arming IMR/ICR/EDGE_SEL) is unchanged - only the
+ * vector ownership moves.
+ */
+#if defined(CONFIG_AP_RCIN_GPIO2_DIRECT_ISR) && DT_NODE_EXISTS(DT_NODELABEL(gpio2))
+#define AP_SKIP_IRQ_FOR_INST(n) \
+	IS_EQ(DT_DEP_ORD(DT_DRV_INST(n)), DT_DEP_ORD(DT_NODELABEL(gpio2)))
+#else
+#define AP_SKIP_IRQ_FOR_INST(n) 0
+#endif
+
+#define MCUX_IGPIO_IRQ_INIT_REAL(n, i)					\
 	do {								\
 		IRQ_CONNECT(DT_INST_IRQ_BY_IDX(n, i, irq),		\
 			    DT_INST_IRQ_BY_IDX(n, i, priority),		\
@@ -389,6 +416,11 @@ static DEVICE_API(gpio, mcux_igpio_driver_api) = {
 									\
 		irq_enable(DT_INST_IRQ_BY_IDX(n, i, irq));		\
 	} while (false)
+
+#define MCUX_IGPIO_IRQ_INIT(n, i)					\
+	COND_CODE_1(AP_SKIP_IRQ_FOR_INST(n),				\
+		    (do { } while (false)),				\
+		    (MCUX_IGPIO_IRQ_INIT_REAL(n, i)))
 
 #define MCUX_IGPIO_INIT(n)						\
 	MCUX_IGPIO_PIN_DECLARE(n)					\
