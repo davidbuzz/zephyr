@@ -296,6 +296,15 @@ static int usbd_cdc_acm_request(struct usbd_class_data *const c_data,
 
 		if (bi->ep == cdc_acm_get_bulk_out(c_data)) {
 			atomic_clear_bit(&data->state, CDC_ACM_RX_FIFO_BUSY);
+			/* Re-trigger the RX handler so the OUT endpoint is
+			 * re-armed if the class is still enabled - without
+			 * this a single cancelled/failed OUT transfer left
+			 * host->device RX dead forever (the handler is only
+			 * ever triggered by enable, irq_rx_enable and
+			 * successful completions). The handler itself bails
+			 * out cleanly when the class is disabled.
+			 */
+			cdc_acm_work_submit(&data->rx_fifo_work);
 		}
 
 		if (bi->ep == cdc_acm_get_bulk_in(c_data)) {
@@ -411,6 +420,15 @@ static void usbd_cdc_acm_resumed(struct usbd_class_data *const c_data)
 	struct cdc_acm_uart_data *data = dev->data;
 
 	atomic_clear_bit(&data->state, CDC_ACM_CLASS_SUSPENDED);
+
+	/* An RX handler run skipped while suspended is never repeated on its
+	 * own - re-trigger it here so the OUT endpoint is re-armed (this was
+	 * the unchecked "USBD class API resumed call" item on the handler's
+	 * trigger list).
+	 */
+	if (!atomic_test_bit(&data->state, CDC_ACM_RX_FIFO_BUSY)) {
+		cdc_acm_work_submit(&data->rx_fifo_work);
+	}
 }
 
 static void *usbd_cdc_acm_get_desc(struct usbd_class_data *const c_data,
@@ -701,9 +719,10 @@ static void cdc_acm_tx_fifo_handler(struct k_work *work)
  * RX handler should be conditionally triggered at:
  *  - (x) cdc_acm_irq_rx_enable()
  *  - (x) RX transfer completion
+ *  - (x) RX transfer cancellation/failure
  *  - (x) the end of cdc_acm_irq_cb_handler
  *  - (x) USBD class API enable call
- *  - ( ) USBD class API resumed call (TODO)
+ *  - (x) USBD class API resumed call
  */
 static void cdc_acm_rx_fifo_handler(struct k_work *work)
 {
@@ -735,6 +754,11 @@ static void cdc_acm_rx_fifo_handler(struct k_work *work)
 
 	buf = cdc_acm_buf_alloc(c_data, cdc_acm_get_bulk_out(c_data));
 	if (buf == NULL) {
+		/* Clear the busy flag so a later trigger can retry - leaking
+		 * it here disabled RX permanently ("RX transfer already in
+		 * progress" on every subsequent attempt).
+		 */
+		atomic_clear_bit(&data->state, CDC_ACM_RX_FIFO_BUSY);
 		return;
 	}
 
@@ -746,6 +770,10 @@ static void cdc_acm_rx_fifo_handler(struct k_work *work)
 		LOG_ERR("Failed to enqueue net_buf for 0x%02x",
 			cdc_acm_get_bulk_out(c_data));
 		net_buf_unref(buf);
+		/* Same leak as the alloc failure above: without this the
+		 * busy flag blocked every future re-arm attempt.
+		 */
+		atomic_clear_bit(&data->state, CDC_ACM_RX_FIFO_BUSY);
 	}
 }
 
