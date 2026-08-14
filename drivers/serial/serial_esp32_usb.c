@@ -171,10 +171,25 @@ static int serial_esp32_usb_irq_tx_ready(const struct device *dev)
 
 static void serial_esp32_usb_irq_rx_enable(const struct device *dev)
 {
-	ARG_UNUSED(dev);
+	struct serial_esp32_usb_data *data = dev->data;
 
 	usb_serial_jtag_ll_clr_intsts_mask(USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT);
 	usb_serial_jtag_ll_ena_intr_mask(USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT);
+
+	/* The OUT_RECV_PKT interrupt is edge-like: it fires when a packet
+	 * lands, not while data is pending. Bytes that arrived while the
+	 * interrupt was disabled (or before the callback was registered)
+	 * would otherwise never produce another edge - and because the
+	 * driver only drains the rx fifo from the callback, a full fifo
+	 * then blocks the host's whole OUT pipe forever. Synthesize a
+	 * callback for already-pending data, exactly as
+	 * serial_esp32_usb_irq_tx_enable() above does for tx.
+	 */
+	if (data->irq_cb != NULL && usb_serial_jtag_ll_rxfifo_data_available()) {
+		unsigned int key = irq_lock();
+		data->irq_cb(dev, data->irq_cb_data);
+		arch_irq_unlock(key);
+	}
 }
 
 static void serial_esp32_usb_irq_rx_disable(const struct device *dev)
