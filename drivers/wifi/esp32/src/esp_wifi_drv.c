@@ -1569,11 +1569,24 @@ static int esp32_wifi_set_config(const struct device *dev __unused,
 			ifx = ESP_IF_WIFI_AP;
 		}
 	#else
-		ret = esp_wifi_set_mode(ESP32_WIFI_MODE_STA);
+		wifi_mode_t mode;
 
-		if (ret != ESP_OK) {
-			LOG_ERR("Failed to set WiFi mode: %d", ret);
-			return -EIO;
+		ret = esp_wifi_get_mode(&mode);
+		if (ret == ESP_OK && mode == ESP32_WIFI_MODE_AP) {
+			/* The single iface is currently the softAP (ap_enable
+			 * updates the link address, which lands here via the
+			 * L2). Forcing STA mode at this point stops the AP the
+			 * moment it started beaconing and leaves an idle STA
+			 * that the blob then modem-sleeps.
+			 */
+			ifx = ESP_IF_WIFI_AP;
+		} else {
+			ret = esp_wifi_set_mode(ESP32_WIFI_MODE_STA);
+
+			if (ret != ESP_OK) {
+				LOG_ERR("Failed to set WiFi mode: %d", ret);
+				return -EIO;
+			}
 		}
 	#endif
 		ret = esp_wifi_set_mac(ifx, config->mac_address.addr);
