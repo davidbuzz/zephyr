@@ -1214,8 +1214,12 @@ static int esp32_wifi_ap_enable(const struct device *dev __unused, struct net_if
 	 * systimer/interrupt-matrix under the running kernel). 10 dBm
 	 * (units of 0.25 dBm) is ample for a nearby station; boards with
 	 * beefier supplies can raise it at runtime afterwards.
+	 * Revised to the API floor 8 (= 2 dBm): 10 dBm proved marginal on the
+	 * CodeCell C6 once the storage thread's flash writes started landing
+	 * concurrently with radio start - flash program current stacked on
+	 * the TX surge and the brown-out returned.
 	 */
-	err = esp_wifi_set_max_tx_power(40);
+	err = esp_wifi_set_max_tx_power(8);
 	if (err) {
 		LOG_WRN("Failed to cap AP TX power (%d)", err);
 	}
