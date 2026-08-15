@@ -32,6 +32,19 @@
  */
 #define USBSERIAL_POLL_OUT_TIMEOUT_MS (50U)
 
+/*
+ * Per-character wait budget while the link looks healthy. The upstream logic
+ * waited the FULL 50 ms per character whenever any recent character had
+ * succeeded - a host whose tty buffer drains in a trickle (device enumerated,
+ * nobody reading) re-armed that window on every stray success, so a single
+ * log burst could spin the calling thread for seconds. Measured on
+ * CodeCell_C6 2026-08-16: a priority-3 thread printing one line every 10 s
+ * starved the WiFi thread and the softAP's beacons stopped. Policy
+ * (maintainer): DISCARD characters that cannot be printed promptly - never
+ * block on a console nobody is draining.
+ */
+#define USBSERIAL_POLL_OUT_CHAR_BUDGET_MS (2U)
+
 struct serial_esp32_usb_config {
 	const struct device *clock_dev;
 	const clock_control_subsys_t clock_subsys;
@@ -69,8 +82,11 @@ static void serial_esp32_usb_poll_out(const struct device *dev, unsigned char c)
 	int64_t start_time = k_uptime_get();
 
 	/*
-	 * If there is no USB host connected, this function will busy-wait once for the timeout
-	 * period, but return immediately for subsequent calls.
+	 * Link considered healthy only while the LAST character succeeded
+	 * recently; then each character may wait at most the short per-char
+	 * budget. A stalled link (no success within the 50 ms window) drops
+	 * immediately and keeps dropping until the host drains the fifo -
+	 * the first successful write re-opens the budget.
 	 */
 	do {
 		if (usb_serial_jtag_ll_txfifo_writable()) {
@@ -79,7 +95,7 @@ static void serial_esp32_usb_poll_out(const struct device *dev, unsigned char c)
 			data->last_tx_time = k_uptime_get();
 			return;
 		}
-	} while ((k_uptime_get() - start_time) < USBSERIAL_POLL_OUT_TIMEOUT_MS &&
+	} while ((k_uptime_get() - start_time) < USBSERIAL_POLL_OUT_CHAR_BUDGET_MS &&
 		 (k_uptime_get() - data->last_tx_time) < USBSERIAL_POLL_OUT_TIMEOUT_MS);
 }
 
