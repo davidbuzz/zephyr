@@ -61,6 +61,8 @@ struct pwm_ledc_esp32_channel_config {
 	ledc_clk_src_t clock_src;
 	uint32_t clock_src_hz;
 	uint32_t duty_val;
+	uint32_t last_period_cycles;
+	uint32_t last_pulse_cycles;
 	bool inverted;
 };
 
@@ -357,6 +359,18 @@ static int pwm_led_esp32_set_cycles(const struct device *dev, uint32_t channel_i
 		channel->inverted = false;
 	}
 
+	/* Unchanged request: the hardware is already outputting exactly this
+	 * waveform, so skip the divider/duty recomputation and register
+	 * writes entirely. Matters at flight-control update rates, where
+	 * the caller pushes every loop regardless of change.
+	 */
+	if (period_cycles == channel->last_period_cycles &&
+	    pulse_cycles == channel->last_pulse_cycles) {
+		goto sem_give;
+	}
+	channel->last_period_cycles = period_cycles;
+	channel->last_pulse_cycles = pulse_cycles;
+
 	if ((pulse_cycles == period_cycles) || (pulse_cycles == 0)) {
 		channel->freq = 0;
 		channel->duty_val = 0;
@@ -373,11 +387,13 @@ static int pwm_led_esp32_set_cycles(const struct device *dev, uint32_t channel_i
 		goto sem_give;
 	}
 
-	/* Update PWM duty  */
-
-	double duty_cycle = (double)pulse_cycles / (double)period_cycles;
-
-	channel->duty_val = (uint32_t)((double)(1 << channel->resolution) * duty_cycle);
+	/* Update PWM duty. Integer arithmetic: the double-precision form this
+	 * replaces ran through soft-float on FPU-less cores (e.g. ESP32-C6),
+	 * costing hundreds of cycles per motor write on the flight-control
+	 * hot path.
+	 */
+	channel->duty_val = (uint32_t)(((uint64_t)pulse_cycles << channel->resolution) /
+				       period_cycles);
 
 	pwm_led_esp32_duty_set(dev, channel);
 
