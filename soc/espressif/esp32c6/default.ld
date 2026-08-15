@@ -310,6 +310,14 @@ SECTIONS
     _init_end = ABSOLUTE(.);
     _iram_text_start = ABSOLUTE(.);
 
+    /* Application-selected hot code. Reuses the ITCM_SECTION linker hook
+     * (zephyr_linker_sources) as the generic "pin this into fast
+     * executable RAM ahead of the flash text rule" injection point -
+     * input sections match first-come-first-served, so entries here win
+     * over .flash.text. Empty unless the application registers a
+     * fragment. */
+    #include <snippets-itcm-section.ld>
+
     *(.iram1 .iram1.*)
     *(.iram0.literal .iram.literal .iram.text.literal .iram0.text .iram.text)
     *libzephyr.a:panic.*(.literal .text .literal.* .text.*)
