@@ -1208,6 +1208,19 @@ static int esp32_wifi_ap_enable(const struct device *dev __unused, struct net_if
 	}
 
 	/*
+	 * Cap TX power before the first beacons go out. The default 20 dBm
+	 * transmit surge browns out small single-supply boards (observed on
+	 * ESP32-C6: Brown-out CORE reset at first beacon, resetting the
+	 * systimer/interrupt-matrix under the running kernel). 10 dBm
+	 * (units of 0.25 dBm) is ample for a nearby station; boards with
+	 * beefier supplies can raise it at runtime afterwards.
+	 */
+	err = esp_wifi_set_max_tx_power(40);
+	if (err) {
+		LOG_WRN("Failed to cap AP TX power (%d)", err);
+	}
+
+	/*
 	 * The blob defaults to modem power save; with the STA half idle it can
 	 * take the chip into a real light sleep. On SoCs whose peripheral
 	 * registers are NOT restored across sleep unless REGDMA retention
