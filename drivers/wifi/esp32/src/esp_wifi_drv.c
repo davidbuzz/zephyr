@@ -1208,6 +1208,20 @@ static int esp32_wifi_ap_enable(const struct device *dev __unused, struct net_if
 	}
 
 	/*
+	 * The blob defaults to modem power save; with the STA half idle it can
+	 * take the chip into a real light sleep. On SoCs whose peripheral
+	 * registers are NOT restored across sleep unless REGDMA retention
+	 * lists exist (e.g. ESP32-C6 in builds without the retention
+	 * subsystem), that wake resets every HP peripheral to defaults -
+	 * including the systimer the OS tick runs on - freezing the kernel.
+	 * An access point must beacon continuously anyway: force PS off.
+	 */
+	err = esp_wifi_set_ps(WIFI_PS_NONE);
+	if (err) {
+		LOG_WRN("Failed to disable power save in AP mode (%d)", err);
+	}
+
+	/*
 	 * Update interface link address to AP MAC.
 	 * In AP-only mode (without CONFIG_ESP32_WIFI_AP_STA_MODE), the interface
 	 * is initialized with STA MAC but operates with AP MAC. Some clients
