@@ -66,6 +66,50 @@ struct pwm_mcux_data {
 #endif
 };
 
+
+/*
+ * MCTRL is shared by every submodule of a FlexPWM instance, but each submodule is
+ * a separate Zephyr device with its own data->lock. PWM_SetPwmLdok(),
+ * PWM_StartTimer() and PWM_StopTimer() are all read-modify-writes on that shared
+ * register (fsl_pwm.h: `base->MCTRL |= ...`), so two submodules updating
+ * concurrently can interleave and:
+ *
+ *   - lose an LDOK, leaving the output stale for a cycle, or
+ *   - clobber another submodule's RUN bit, stopping its timer outright.
+ *
+ * The per-device mutex cannot prevent this because the contending callers hold
+ * *different* mutexes. Nor can it be fixed by ordering: the window is a single
+ * C statement compiled to load/or/store.
+ *
+ * These wrappers make each MCTRL read-modify-write atomic with irq_lock(), which
+ * also covers ISR-context callers that cannot take a mutex at all. The critical
+ * section is three instructions, so the cost is negligible next to the ~350 us
+ * the busy-wait it replaced used to take.
+ */
+static ALWAYS_INLINE void mcux_pwm_ldok_atomic(PWM_Type *base, uint8_t sub, bool value)
+{
+	const unsigned int key = irq_lock();
+
+	PWM_SetPwmLdok(base, sub, value);
+	irq_unlock(key);
+}
+
+static ALWAYS_INLINE void mcux_pwm_start_atomic(PWM_Type *base, uint8_t sub)
+{
+	const unsigned int key = irq_lock();
+
+	PWM_StartTimer(base, sub);
+	irq_unlock(key);
+}
+
+static ALWAYS_INLINE void mcux_pwm_stop_atomic(PWM_Type *base, uint8_t sub)
+{
+	const unsigned int key = irq_lock();
+
+	PWM_StopTimer(base, sub);
+	irq_unlock(key);
+}
+
 static int mcux_pwm_set_cycles_internal(const struct device *dev, uint32_t channel,
 			       uint32_t period_cycles, uint32_t pulse_cycles,
 			       pwm_flags_t flags)
@@ -98,7 +142,7 @@ static int mcux_pwm_set_cycles_internal(const struct device *dev, uint32_t chann
 
 		data->channel[channel].pwmchannelenable = true;
 
-		PWM_StopTimer(config->base, 1U << config->index);
+		mcux_pwm_stop_atomic(config->base, 1U << config->index);
 
 		/*
 		 * We will directly write the duty cycle pulse width
@@ -176,9 +220,9 @@ static int mcux_pwm_set_cycles_internal(const struct device *dev, uint32_t chann
 					 (uint16_t)(period_cycles - 1U));
 		}
 
-		PWM_SetPwmLdok(config->base, 1U << config->index, true);
+		mcux_pwm_ldok_atomic(config->base, 1U << config->index, true);
 
-		PWM_StartTimer(config->base, 1U << config->index);
+		mcux_pwm_start_atomic(config->base, 1U << config->index);
 	} else {
 		/* A previous load may still be pending (LDOK set), which locks the
 		 * double-buffered VALx registers. Busy-waiting for the hardware to
@@ -190,8 +234,16 @@ static int mcux_pwm_set_cycles_internal(const struct device *dev, uint32_t chann
 		 * the next reload, which is the desired latest-value-wins
 		 * semantics for a repeatedly-updated output.
 		 */
-		if (config->base->MCTRL & PWM_MCTRL_LDOK(1U << config->index)) {
-			PWM_SetPwmLdok(config->base, 1U << config->index, false);
+		{
+			/* read-and-clear under one lock: a separate read could
+			 * observe an LDOK that another submodule's update sets
+			 * immediately afterwards. */
+			const unsigned int key = irq_lock();
+
+			if (config->base->MCTRL & PWM_MCTRL_LDOK(1U << config->index)) {
+				PWM_SetPwmLdok(config->base, 1U << config->index, false);
+			}
+			irq_unlock(key);
 		}
 
 		/* Setup VALx values directly for edge aligned PWM */
@@ -215,7 +267,7 @@ static int mcux_pwm_set_cycles_internal(const struct device *dev, uint32_t chann
 					 kPWM_ValueRegister_0,
 					 (uint16_t)pulse_cycles);
 		}
-		PWM_SetPwmLdok(config->base, 1U << config->index, true);
+		mcux_pwm_ldok_atomic(config->base, 1U << config->index, true);
 	}
 
 	return 0;
@@ -593,7 +645,7 @@ static int mcux_pwm_enable_capture(const struct device *dev, uint32_t channel)
 
 	/* Start the PWM counter if it's stopped.*/
 	if ((config->base->MCTRL & PWM_MCTRL_RUN_MASK) == 0) {
-		PWM_StartTimer(config->base, (1U << config->index));
+		mcux_pwm_start_atomic(config->base, 1U << config->index);
 	}
 
 	return 0;
