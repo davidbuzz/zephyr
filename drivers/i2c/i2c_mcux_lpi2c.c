@@ -438,9 +438,31 @@ static int mcux_lpi2c_transfer_edma(const struct device *dev, struct i2c_msg *ms
 		goto out;
 	}
 
-	/* bounded wait: a wedged bus reports instead of hanging the caller.
-	 * 100 ms >> any legal transfer (256 B at 100 kHz is ~23 ms). */
-	if (k_sem_take(&e->done, K_MSEC(100)) != 0) {
+	/* Bounded wait, sized like AP_HAL_ChibiOS bounds its I2C transfers
+	 * (AP_HAL_ChibiOS/I2CDevice.cpp:374-376: twice the expected transfer
+	 * time, floored at 4 ms) rather than a flat 100 ms.
+	 *
+	 * Why this matters: ArduPilot retries a failed transfer 3 times while
+	 * holding its per-bus DeviceBus semaphore, so a flat 100 ms turns one
+	 * NAKing device into a 300 ms stall of the WHOLE bus. On mr_vmu_rt1176
+	 * that starved the BMM150 compass sharing bus 2 with a BMP388 baro and
+	 * put both into Bad Health: bus callbacks were measured averaging
+	 * 24-29 ms with maxima of 210-275 ms, against ChibiOS's ~12 ms worst
+	 * case for the same three attempts.
+	 *
+	 * Bytes are costed at the SLOWEST legal I2C rate (100 kHz, 9 bit-times
+	 * per byte incl. ack) so no bitrate lookup is needed here, and the
+	 * result is capped at the previous 100 ms so no legal long transfer can
+	 * regress - this can only ever shorten the wait. */
+	uint32_t to_ms = 1u + 2u * ((((uint32_t)e->n_cmds * 2u +
+				      (uint32_t)e->rx_len) * 90u) / 1000u);
+	if (to_ms < 4u) {
+		to_ms = 4u;
+	}
+	if (to_ms > 100u) {
+		to_ms = 100u;
+	}
+	if (k_sem_take(&e->done, K_MSEC(to_ms)) != 0) {
 		mcux_lpi2c_edma_finish(dev, -ETIMEDOUT);
 		(void)k_sem_take(&e->done, K_NO_WAIT);
 	}
