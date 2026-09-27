@@ -38,6 +38,15 @@ LOG_MODULE_REGISTER(mcux_lpi2c);
 
 
 #include "i2c-priv.h"
+
+/* Instrumentation for the ArduPilot Zephyr HAL bring-up: where does a
+ * SUCCESSFUL lpi2c transfer spend its time? Read and zeroed by
+ * AP_HAL_Zephyr/Scheduler.cpp's I2C report. */
+uint32_t ap_lpi2c_stat_lock_us;
+uint32_t ap_lpi2c_stat_lock_n;
+uint32_t ap_lpi2c_stat_busy_us;
+uint32_t ap_lpi2c_stat_busy_n;
+uint32_t ap_lpi2c_stat_bbok_us;
 /* Wait for the duration of 12 bits to detect a NAK after a bus
  * address scan.  (10 appears sufficient, 20% safety factor.)
  */
@@ -362,16 +371,28 @@ static int mcux_lpi2c_transfer_edma(const struct device *dev, struct i2c_msg *ms
 	e->bufs->cmds[n++] = LPI2C_CMD_STOP;
 	e->n_cmds = n;
 
+	/* Instrumented: AP measured SUCCESSFUL transfers taking 7-21 ms mean
+	 * (worst 1.14 s) with zero NAKs and zero completion timeouts. The
+	 * completion wait below is bounded at ~4 ms for a small transfer, so that
+	 * time cannot be there - it has to be this K_FOREVER lock, or the busy-bus
+	 * check. Split the two so the next capture says which. */
+	const uint32_t ap_lk_t0 = k_cycle_get_32();
 	int ret = k_sem_take(&data->lock, K_FOREVER);
 	if (ret) {
 		return ret;
 	}
+	ap_lpi2c_stat_lock_us += k_cyc_to_us_floor32(k_cycle_get_32() - ap_lk_t0);
+	ap_lpi2c_stat_lock_n++;
 	(void)pm_device_runtime_get(dev);
 
+	const uint32_t ap_bb_t0 = k_cycle_get_32();
 	if (LPI2C_CheckForBusyBus(base) != kStatus_Success) {
+		ap_lpi2c_stat_busy_us += k_cyc_to_us_floor32(k_cycle_get_32() - ap_bb_t0);
+		ap_lpi2c_stat_busy_n++;
 		ret = -EBUSY;
 		goto out;
 	}
+	ap_lpi2c_stat_bbok_us += k_cyc_to_us_floor32(k_cycle_get_32() - ap_bb_t0);
 
 	LPI2C_MasterClearStatusFlags(base, (uint32_t)kLPI2C_MasterClearFlags);
 	k_sem_reset(&e->done);
