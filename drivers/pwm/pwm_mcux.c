@@ -237,7 +237,8 @@ static int mcux_pwm_set_cycles_internal(const struct device *dev, uint32_t chann
 		{
 			/* read-and-clear under one lock: a separate read could
 			 * observe an LDOK that another submodule's update sets
-			 * immediately afterwards. */
+			 * immediately afterwards.
+			 */
 			const unsigned int key = irq_lock();
 
 			if (config->base->MCTRL & PWM_MCTRL_LDOK(1U << config->index)) {

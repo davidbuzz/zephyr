@@ -41,7 +41,8 @@ LOG_MODULE_REGISTER(mcux_lpi2c);
 
 /* Instrumentation for the ArduPilot Zephyr HAL bring-up: where does a
  * SUCCESSFUL lpi2c transfer spend its time? Read and zeroed by
- * AP_HAL_Zephyr/Scheduler.cpp's I2C report. */
+ * AP_HAL_Zephyr/Scheduler.cpp's I2C report.
+ */
 uint32_t ap_lpi2c_stat_lock_us;
 uint32_t ap_lpi2c_stat_lock_n;
 uint32_t ap_lpi2c_stat_busy_us;
@@ -375,7 +376,8 @@ static int mcux_lpi2c_transfer_edma(const struct device *dev, struct i2c_msg *ms
 	 * (worst 1.14 s) with zero NAKs and zero completion timeouts. The
 	 * completion wait below is bounded at ~4 ms for a small transfer, so that
 	 * time cannot be there - it has to be this K_FOREVER lock, or the busy-bus
-	 * check. Split the two so the next capture says which. */
+	 * check. Split the two so the next capture says which.
+	 */
 	const uint32_t ap_lk_t0 = k_cycle_get_32();
 	int ret = k_sem_take(&data->lock, K_FOREVER);
 	if (ret) {
@@ -453,7 +455,8 @@ static int mcux_lpi2c_transfer_edma(const struct device *dev, struct i2c_msg *ms
 	 * Bytes are costed at the SLOWEST legal I2C rate (100 kHz, 9 bit-times
 	 * per byte incl. ack) so no bitrate lookup is needed here, and the
 	 * result is capped at the previous 100 ms so no legal long transfer can
-	 * regress - this can only ever shorten the wait. */
+	 * regress - this can only ever shorten the wait.
+	 */
 	uint32_t to_ms = 1u + 2u * ((((uint32_t)e->n_cmds * 2u +
 				      (uint32_t)e->rx_len) * 90u) / 1000u);
 	if (to_ms < 4u) {
